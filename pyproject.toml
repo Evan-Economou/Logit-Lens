@@ -1,0 +1,15 @@
+[project]
+name = "logit-lens"
+version = "0.1.0"
+description = "Scripts for logit lens and tuned lens experiments."
+authors = [
+	{ name = "Evan Economou", email = "eteconomou@gmail.com" }
+]
+
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "torch",
+  "transformer-lens",
+  "rich",
+  "pyarrow",
+]
