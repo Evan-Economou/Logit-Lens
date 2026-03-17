@@ -185,7 +185,7 @@ HTML_PAGE = """
     <div class="panel">
       <h1>Logit Lens / Tuned Lens (pythia-14m)</h1>
       <div class="row">
-        <input id="text" type="text" value="trees are green" />
+        <input id="text" type="text" value="" placeholder="Enter prompt here" />
         <select id="mode">
           <option value="logit">Logit Lens</option>
           <option value="tuned">Tuned Lens</option>
