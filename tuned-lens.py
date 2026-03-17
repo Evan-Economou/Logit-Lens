@@ -1,3 +1,5 @@
+import argparse
+import time
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -82,6 +84,9 @@ def train_tuned_lens(model: HookedTransformer, tuned_lens_layers: TunedLens,
                      texts: list[str], n_epochs: int,
                      status_callback=None) -> None:
     """Train one tuned lens layer per corresponding transformer layer."""
+    if status_callback is None:
+        status_callback = print
+
     if status_callback is not None:
         status_callback("Initializing tuned lens layers...")
 
@@ -133,6 +138,85 @@ def train_tuned_lens(model: HookedTransformer, tuned_lens_layers: TunedLens,
     tuned_lens_layers.eval()
 
 
-# Backward-compatible alias.
-TunedLensLayers = TunedLens
-TunedLensProbes = TunedLens
+def _print_top1_preview(preds, token_strs: list[str], max_layers: int = 6) -> None:
+    """Print a compact per-layer top-1 token preview in the terminal."""
+    layer_count = min(max_layers, len(preds))
+    print("\nTop-1 preview by layer:")
+    for layer_idx in range(layer_count):
+        pos_preds = preds[layer_idx]
+        cells = []
+        for pos, pred_list in enumerate(pos_preds):
+            token, prob = pred_list[0]
+            source = token_strs[pos].replace("\n", "\\n")
+            pred = token.replace("\n", "\\n")
+            cells.append(f"{source}->{pred} ({prob:4.1%})")
+        print(f"  L{layer_idx}: " + " | ".join(cells))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Terminal runner for tuned lens utilities")
+    parser.add_argument(
+        "text",
+        nargs="?",
+        default="trees are green",
+        help="Input text to analyze (default: trees are green)",
+    )
+    parser.add_argument("--top-k", type=int, default=3, help="Top-k tokens per position")
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Train tuned lens weights from a local parquet file before analysis",
+    )
+    parser.add_argument("--epochs", type=int, default=3, help="Training epochs")
+    parser.add_argument("--max-samples", type=int, default=60, help="Max parquet samples")
+    parser.add_argument(
+        "--parquet",
+        type=Path,
+        default=Path(__file__).with_name("train-00000-of-00001-4746b8785c874cc7.parquet"),
+        help="Path to local parquet file with a text column",
+    )
+    args = parser.parse_args()
+
+    if args.top_k < 1:
+        raise ValueError("--top-k must be at least 1")
+
+    startup = time.perf_counter()
+    print("Loading pythia-14m...")
+    model: HookedTransformer = HookedTransformer.from_pretrained("pythia-14m")
+    model.eval()
+    tuned_lens = TunedLens(model.cfg.n_layers, model.cfg.d_model)
+    print(f"Model ready in {time.perf_counter() - startup:.2f}s")
+
+    if args.train:
+        print(f"Reading training texts from {args.parquet}")
+        texts = load_texts_from_parquet(args.parquet, max_samples=args.max_samples)
+        print(f"Loaded {len(texts)} samples")
+        train_start = time.perf_counter()
+        train_tuned_lens(
+            model=model,
+            tuned_lens_layers=tuned_lens,
+            texts=texts,
+            n_epochs=args.epochs,
+            status_callback=print,
+        )
+        print(f"Training finished in {time.perf_counter() - train_start:.2f}s")
+    else:
+        print("Skipping training (use --train to fit tuned lens weights).")
+
+    analyze_start = time.perf_counter()
+    print(f"Running tuned lens on: {args.text!r}")
+    with torch.no_grad():
+        _, cache = model.run_with_cache(args.text)
+        preds = tuned_lens_predictions(model, cache, tuned_lens, top_k=args.top_k)
+
+    tokens = model.to_tokens(args.text)
+    token_strs = [model.tokenizer.decode([t.item()]) for t in tokens[0]]
+    print(
+        f"Analyzed {len(preds)} layers x {len(token_strs)} tokens "
+        f"in {time.perf_counter() - analyze_start:.2f}s"
+    )
+    _print_top1_preview(preds, token_strs)
+
+
+if __name__ == "__main__":
+    main()
