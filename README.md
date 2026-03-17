@@ -8,6 +8,9 @@ Either script can be run individually through the command line as well, with fla
 - `tuned-lens.py`: tuned-lens training/inference script with save/load support
 - `gui.py`: locally hosted html frontend for logit lens and tuned lens
 
+## Running the code
+Running `uv sync` will create a virtual environment with all the required dependencies. From there, you can run any of the three scripts on their own, with behavior described in more detail below.
+
 ## lens.py
 `python lens.py`
 
