@@ -19,6 +19,7 @@ from transformer_lens import HookedTransformer
 
 PARQUET_PATH = Path(__file__).with_name("train-00000-of-00001-4746b8785c874cc7.parquet")
 TUNED_LENS_MODULE_PATH = Path(__file__).with_name("tuned-lens.py")
+TUNED_LENS_WEIGHTS_PATH = Path(__file__).with_name("tuned-lens-state.pt")
 
 _tuned_spec = importlib.util.spec_from_file_location("tuned_lens_module", TUNED_LENS_MODULE_PATH)
 if _tuned_spec is None or _tuned_spec.loader is None:
@@ -30,6 +31,8 @@ TunedLens = _tuned_module.TunedLens
 tuned_lens_predictions = _tuned_module.tuned_lens_predictions
 load_texts_from_parquet = _tuned_module.load_texts_from_parquet
 train_tuned_lens = _tuned_module.train_tuned_lens
+save_tuned_lens = _tuned_module.save_tuned_lens
+load_tuned_lens = _tuned_module.load_tuned_lens
 
 
 # ── core computation ──────────────────────────────────────────────────────────
@@ -195,7 +198,11 @@ HTML_PAGE = """
           <option>10</option>
         </select>
         <button class="btn-primary" id="analyzeBtn">Analyze</button>
-        <button class="btn-secondary" id="trainBtn">Train Tuned Lens (Local Parquet)</button>
+        <button class="btn-secondary" id="trainBtn">Train and Save Tuned Lens</button>
+      </div>
+      <div class="row" style="margin-top: 0.6rem;">
+        <input id="lensPath" type="text" value="tuned-lens-state.pt" />
+        <button class="btn-secondary" id="loadBtn">Load Tuned Lens Weights</button>
       </div>
       <div class="status" id="status">Loading model...</div>
       <div class="progress-shell" aria-label="Training progress">
@@ -326,7 +333,12 @@ HTML_PAGE = """
     async function train() {
       statusEl.textContent = "Starting tuned lens training on local parquet...";
       setProgress(5, "Starting training...", true);
-      const r = await fetch("/train", { method: "POST" });
+      const lensPath = document.getElementById("lensPath").value.trim();
+      const r = await fetch("/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ save_path: lensPath }),
+      });
       const data = await r.json();
       if (!r.ok) {
         statusEl.textContent = data.error || "Training failed to start.";
@@ -337,8 +349,28 @@ HTML_PAGE = """
       setProgress(10, "Queued", true);
     }
 
+    async function loadLens() {
+      const lensPath = document.getElementById("lensPath").value.trim();
+      statusEl.textContent = "Loading tuned lens weights...";
+      const r = await fetch("/load_tuned_lens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: lensPath }),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        statusEl.textContent = data.error || "Failed to load tuned lens.";
+        return;
+      }
+      statusEl.textContent = data.message;
+      if (Number.isFinite(Number(data.training_progress))) {
+        setProgress(Number(data.training_progress), "Loaded tuned lens", false);
+      }
+    }
+
     document.getElementById("analyzeBtn").addEventListener("click", analyze);
     document.getElementById("trainBtn").addEventListener("click", train);
+    document.getElementById("loadBtn").addEventListener("click", loadLens);
     setInterval(refreshStatus, 1500);
     refreshStatus();
   </script>
@@ -355,6 +387,7 @@ class LensService:
         self.training_status = ""
         self.training_progress = 0
         self.training_in_progress = False
+        self.tuned_lens_path = str(TUNED_LENS_WEIGHTS_PATH)
         self.lock = threading.Lock()
         self._load_model_async()
 
@@ -386,6 +419,7 @@ class LensService:
                 "training_status": self.training_status,
               "training_progress": self.training_progress,
                 "training_in_progress": self.training_in_progress,
+                "tuned_lens_path": self.tuned_lens_path,
             }
 
     def analyze(self, text: str, mode: str, top_k: int) -> dict[str, Any]:
@@ -426,7 +460,7 @@ class LensService:
             "top1": top1_rows,
         }
 
-    def train_async(self, n_epochs: int = 3, max_samples: int = 60):
+    def train_async(self, n_epochs: int = 3, max_samples: int = 60, save_path: Path | None = None):
         with self.lock:
             if self.training_in_progress:
                 raise RuntimeError("Training is already running.")
@@ -435,6 +469,8 @@ class LensService:
             self.training_in_progress = True
             self.training_status = "Loading local parquet..."
             self.training_progress = 3
+        target_path = Path(save_path) if save_path is not None else TUNED_LENS_WEIGHTS_PATH
+        self.tuned_lens_path = str(target_path)
 
         def _train():
             try:
@@ -470,8 +506,10 @@ class LensService:
                     status_callback=_status,
                 )
 
+                saved_path = save_tuned_lens(tuned_lens, target_path)
+
                 with self.lock:
-                    self.training_status = "Training complete on local parquet"
+                    self.training_status = f"Training complete and saved to {saved_path}"
                     self.training_progress = 100
             except Exception as exc:
                 with self.lock:
@@ -482,6 +520,22 @@ class LensService:
                     self.training_in_progress = False
 
         threading.Thread(target=_train, daemon=True).start()
+
+    def load_tuned_lens_from_path(self, path: Path | None = None) -> Path:
+        with self.lock:
+            if self.training_in_progress:
+                raise RuntimeError("Cannot load tuned lens while training is in progress.")
+            if self.tuned_lens is None:
+                raise RuntimeError("Tuned lens is unavailable.")
+            tuned_lens = self.tuned_lens
+
+        target_path = Path(path) if path is not None else TUNED_LENS_WEIGHTS_PATH
+        load_tuned_lens(tuned_lens, target_path)
+        with self.lock:
+            self.training_status = f"Loaded tuned lens from {target_path}"
+            self.training_progress = 100
+            self.tuned_lens_path = str(target_path)
+        return target_path
 
 
 service = LensService()
@@ -563,13 +617,34 @@ class LensRequestHandler(BaseHTTPRequestHandler):
       return
 
     if self.path == "/train":
+      payload = self._read_json_body()
+      save_path_raw = payload.get("save_path") if isinstance(payload, dict) else None
+      save_path = Path(str(save_path_raw).strip()) if save_path_raw else None
+
       try:
-        service.train_async(n_epochs=3, max_samples=60)
+        service.train_async(n_epochs=3, max_samples=60, save_path=save_path)
       except Exception as exc:
         self._send_json({"error": str(exc)}, status_code=400)
         return
 
-      self._send_json({"message": "Training started on local parquet."})
+      if save_path is None:
+        message = f"Training started on local parquet. Weights will be saved to {TUNED_LENS_WEIGHTS_PATH}."
+      else:
+        message = f"Training started on local parquet. Weights will be saved to {save_path}."
+      self._send_json({"message": message})
+      return
+
+    if self.path == "/load_tuned_lens":
+      payload = self._read_json_body()
+      path_raw = payload.get("path") if isinstance(payload, dict) else None
+      load_path = Path(str(path_raw).strip()) if path_raw else None
+      try:
+        loaded_path = service.load_tuned_lens_from_path(load_path)
+      except Exception as exc:
+        self._send_json({"error": str(exc)}, status_code=400)
+        return
+
+      self._send_json({"message": f"Loaded tuned lens from {loaded_path}", "training_progress": 100})
       return
 
     self._send_json({"error": "Not found."}, status_code=404)

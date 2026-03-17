@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from transformer_lens import HookedTransformer
 
 
+DEFAULT_TUNED_LENS_PATH = Path(__file__).with_name("tuned-lens-state.pt")
+
+
 class TunedLens(nn.Module):
     """One learned affine map per transformer layer.
 
@@ -138,6 +141,37 @@ def train_tuned_lens(model: HookedTransformer, tuned_lens_layers: TunedLens,
     tuned_lens_layers.eval()
 
 
+def save_tuned_lens(tuned_lens_layers: TunedLens, path: Path) -> Path:
+    """Save tuned lens weights to disk."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": tuned_lens_layers.state_dict(),
+            "n_layers": len(tuned_lens_layers.layer_maps),
+            "d_model": tuned_lens_layers.layer_maps[0].in_features,
+        },
+        path,
+    )
+    return path
+
+
+def load_tuned_lens(tuned_lens_layers: TunedLens, path: Path) -> None:
+    """Load tuned lens weights from disk into an existing TunedLens module."""
+    path = Path(path)
+    if not path.exists():
+        raise RuntimeError(f"Tuned lens state file not found: {path}")
+
+    payload = torch.load(path, map_location="cpu")
+    state_dict = payload.get("state_dict") if isinstance(payload, dict) else None
+    if state_dict is None:
+        # Backward compatibility: support raw state_dict files.
+        state_dict = payload
+
+    tuned_lens_layers.load_state_dict(state_dict, strict=True)
+    tuned_lens_layers.eval()
+
+
 def _print_top1_preview(preds, token_strs: list[str], max_layers: int = 6) -> None:
     """Print a compact per-layer top-1 token preview in the terminal."""
     layer_count = min(max_layers, len(preds))
@@ -175,6 +209,18 @@ def main() -> None:
         default=Path(__file__).with_name("train-00000-of-00001-4746b8785c874cc7.parquet"),
         help="Path to local parquet file with a text column",
     )
+    parser.add_argument(
+        "--load",
+        type=Path,
+        default=None,
+        help="Load tuned lens weights from this file instead of starting from identity",
+    )
+    parser.add_argument(
+        "--save",
+        type=Path,
+        default=DEFAULT_TUNED_LENS_PATH,
+        help="Save tuned lens weights to this file after training",
+    )
     args = parser.parse_args()
 
     if args.top_k < 1:
@@ -186,6 +232,12 @@ def main() -> None:
     model.eval()
     tuned_lens = TunedLens(model.cfg.n_layers, model.cfg.d_model)
     print(f"Model ready in {time.perf_counter() - startup:.2f}s")
+
+    if args.load is not None:
+        load_start = time.perf_counter()
+        print(f"Loading tuned lens weights from {args.load}")
+        load_tuned_lens(tuned_lens, args.load)
+        print(f"Loaded tuned lens in {time.perf_counter() - load_start:.2f}s")
 
     if args.train:
         print(f"Reading training texts from {args.parquet}")
@@ -200,8 +252,12 @@ def main() -> None:
             status_callback=print,
         )
         print(f"Training finished in {time.perf_counter() - train_start:.2f}s")
+        saved_to = save_tuned_lens(tuned_lens, args.save)
+        print(f"Saved tuned lens weights to {saved_to}")
     else:
-        print("Skipping training (use --train to fit tuned lens weights).")
+        if args.load is None:
+            print("Skipping training and using identity-initialized tuned lens.")
+            print("Use --train to fit or --load to restore saved tuned lens weights.")
 
     analyze_start = time.perf_counter()
     print(f"Running tuned lens on: {args.text!r}")
