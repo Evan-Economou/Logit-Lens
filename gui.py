@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from transformer_lens import HookedTransformer
+from lens import compute_logit_lens_predictions
 
 
 PARQUET_PATH = Path(__file__).with_name("train-00000-of-00001-4746b8785c874cc7.parquet")
@@ -33,30 +33,6 @@ load_texts_from_parquet = _tuned_module.load_texts_from_parquet
 train_tuned_lens = _tuned_module.train_tuned_lens
 save_tuned_lens = _tuned_module.save_tuned_lens
 load_tuned_lens = _tuned_module.load_tuned_lens
-
-
-# ── core computation ──────────────────────────────────────────────────────────
-
-def logit_lens_predictions(model: HookedTransformer, cache, top_k: int):
-    """Return predictions[layer][pos] = [(token_str, prob), ...]."""
-    results = []
-    for layer in range(model.cfg.n_layers):
-        resid = cache["resid_post", layer]       # [1, seq, d_model]
-        normed = model.ln_final(resid)
-        logits = model.unembed(normed)           # [1, seq, vocab]
-        probs = F.softmax(logits[0], dim=-1)     # [seq, vocab]
-        top_probs, top_ids = torch.topk(probs, top_k, dim=-1)
-        layer_preds = []
-        for pos in range(probs.shape[0]):
-            layer_preds.append(
-                [
-                    (model.tokenizer.decode([top_ids[pos, i].item()]),
-                     top_probs[pos, i].item())
-                    for i in range(top_k)
-                ]
-            )
-        results.append(layer_preds)
-    return results
 
 
 # ── HTML interface server ─────────────────────────────────────────────────────
@@ -438,7 +414,7 @@ class LensService:
                 preds = tuned_lens_predictions(model, cache, tuned_lens, top_k)
                 mode_label = "Tuned Lens"
             else:
-                preds = logit_lens_predictions(model, cache, top_k)
+                preds = compute_logit_lens_predictions(model, cache, top_k)
                 mode_label = "Logit Lens"
 
         tokens = model.to_tokens(text)

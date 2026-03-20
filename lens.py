@@ -1,5 +1,6 @@
 import argparse
 import time
+from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -23,17 +24,18 @@ def prob_color(p: float) -> str:
         return "dim white"
 
 
-def logit_lens_predictions(
-    model: HookedTransformer, cache, top_k: int
+def compute_logit_lens_predictions(
+    model: HookedTransformer,
+    cache,
+    top_k: int,
+    layers: Iterable[int] | None = None,
 ) -> list[list[list[tuple[str, float]]]]:
     """Return predictions[layer][pos] = [(token_str, prob), ...]."""
-    start = time.perf_counter()
+    if layers is None:
+        layers = range(model.cfg.n_layers)
+
     results = []
-    for layer in track(
-        range(model.cfg.n_layers),
-        description="Computing per-layer logits",
-        console=console,
-    ):
+    for layer in layers:
         resid = cache["resid_post", layer]          # [1, seq, d_model]
         normed = model.ln_final(resid)              # [1, seq, d_model]
         logits = model.unembed(normed)              # [1, seq, vocab]
@@ -48,6 +50,20 @@ def logit_lens_predictions(
                 ]
             )
         results.append(layer_preds)
+    return results
+
+
+def logit_lens_predictions(
+    model: HookedTransformer, cache, top_k: int
+) -> list[list[list[tuple[str, float]]]]:
+    """Return predictions[layer][pos] = [(token_str, prob), ...]."""
+    start = time.perf_counter()
+    layer_iter = track(
+        range(model.cfg.n_layers),
+        description="Computing per-layer logits",
+        console=console,
+    )
+    results = compute_logit_lens_predictions(model, cache, top_k, layers=layer_iter)
     elapsed = time.perf_counter() - start
     console.print(f"[dim]Computed {len(results)} layers in {elapsed:.2f}s[/dim]")
     return results
